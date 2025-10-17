@@ -153,7 +153,7 @@ def capture_single_weight():
     try:
         # Trouver le port de la balance
         ports = serial.tools.list_ports.comports()
-        print(f"Ports disponibles: {[p.device for p in ports]}")
+        #print(f"Ports disponibles: {[p.device for p in ports]}")
         
         for port in ports:
             try:
@@ -171,7 +171,7 @@ def capture_single_weight():
                 # Lire les données
                 start_time = time.time()
                 buffer = bytearray()
-                print("Début de la capture...")
+                #print("Début de la capture...")
                 
                 while time.time() - start_time < CAPTURE_TIMEOUT:
                     to_read = ser.in_waiting
@@ -186,7 +186,7 @@ def capture_single_weight():
                             if frame_candidate.endswith(b'kg') and frame_candidate[1] in [ord('w'), ord('n')]:
                                 weight = parse_weight_data(frame_candidate)
                                 if weight is not None:
-                                    print(f"Poids capturé: {weight}kg")
+                                    #print(f"Poids capturé: {weight}kg")
                                     return weight
                     
                     time.sleep(0.1)
@@ -460,14 +460,14 @@ class ScaleTrayApp:
                     return
             
             # Capture du poids
-            win32api.MessageBox(
-                0, 
-                "Placez l'objet sur la balance et attendez la stabilisation...", 
-                "Capture en cours", 
-                win32con.MB_ICONINFORMATION | win32con.MB_OK
-            )
+            # win32api.MessageBox(
+            #     0, 
+            #     "Placez l'objet sur la balance et attendez la stabilisation...", 
+            #     "Capture en cours", 
+            #     win32con.MB_ICONINFORMATION | win32con.MB_OK
+            # )
             
-            print("Début de la capture du poids...")
+            #print("Début de la capture du poids...")
             weight = capture_single_weight()
             
             if weight is None:
@@ -480,7 +480,7 @@ class ScaleTrayApp:
                 return
             
             # Envoi à l'API
-            print(f"Envoi du poids {weight}kg à l'API...")
+            #print(f"Envoi du poids {weight}kg à l'API...")
             if send_to_api(weight):
                 win32api.MessageBox(
                     0, 
