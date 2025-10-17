@@ -225,6 +225,45 @@ def send_to_api(weight_kg):
         print(f"Erreur API: {str(e)}")
         return False
 
+def get_latest_weight_from_api():
+    """Récupère le dernier poids depuis l'API."""
+    try:
+        params = {"desktop": DESKTOP, "company": COMPANY}
+        response = requests.get(API_URL, params=params, timeout=10)
+
+        if response.status_code == 200:
+            data = response.json()
+            if data and "valeur" in data:
+                return float(data["valeur"])
+            return None # Pas de poids trouvé
+        elif response.status_code == 404:
+            return None # Pas de poids trouvé
+        else:
+            print(f"Erreur GET API ({response.status_code}): {response.text}")
+            return "error"
+    except Exception as e:
+        print(f"Erreur connexion GET API: {e}")
+        return "error"
+
+def show_last_weight():
+    """Affiche le dernier poids stocké dans une MessageBox."""
+    weight = get_latest_weight_from_api()
+
+    if isinstance(weight, float):
+        message = f"Dernier poids stocké : {weight} kg"
+        title = "Information"
+        icon = win32con.MB_ICONINFORMATION
+    elif weight is None:
+        message = "Aucun poids n'est actuellement stocké pour ce poste."
+        title = "Information"
+        icon = win32con.MB_ICONINFORMATION
+    else: # "error"
+        message = "Impossible de récupérer le dernier poids. Vérifiez les logs."
+        title = "Erreur"
+        icon = win32con.MB_ICONERROR
+
+    win32api.MessageBox(0, message, title, icon)
+
 class ScaleTrayApp:
     def __init__(self):
         self.hwnd = None
@@ -371,6 +410,8 @@ class ScaleTrayApp:
                 sys.exit(0)
             elif cmd == 1006:  # Capter le poids
                 threading.Thread(target=self.capture_and_send_weight).start()
+            elif cmd == 1007:  # Voir dernier poids
+                threading.Thread(target=show_last_weight).start()
             return 0
             
         return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
@@ -404,7 +445,8 @@ class ScaleTrayApp:
             win32gui.AppendMenu(menu, win32con.MF_STRING, 1003, "Redémarrer le service")
         
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
-        win32gui.AppendMenu(menu, win32con.MF_STRING, 1006, "Capter le poids")  
+        win32gui.AppendMenu(menu, win32con.MF_STRING, 1006, "Capter le poids")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, 1007, "Voir dernier poids stocké")
         win32gui.AppendMenu(menu, win32con.MF_STRING, 1004, "Voir les logs")
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
         win32gui.AppendMenu(menu, win32con.MF_STRING, 1005, "Quitter")
