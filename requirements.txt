@@ -1,0 +1,4 @@
+Flask
+pyserial
+pywin32
+requests
