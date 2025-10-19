@@ -1,4 +1,4 @@
-import os, sys, ctypes, traceback, socket
+import os, sys, ctypes, traceback, socket, threading
 import win32serviceutil
 import win32service
 import win32event
@@ -6,11 +6,16 @@ import servicemanager
 import logging
 import logging.handlers
 import serial
-import requests
 import time
 import serial.tools.list_ports
-from datetime import datetime, date
-from collections import deque  
+from collections import deque
+from flask import Flask, request, jsonify
+
+# --- DataStore (local database) ---
+import datastore
+
+# --- Flask App ---
+app = Flask(__name__)
 
 #####################################
 
@@ -90,7 +95,6 @@ if not os.path.exists(LOG_DIR):
 LOG_FILE = os.path.join(LOG_DIR, "OdmService.log")
 
 # Configuration de l'API
-API_URL = "https://capturepoidsapi.odmtec.com/api/poids"
 COMPANY = "SITC, SAN-PEDRO"
 DESKTOP = socket.gethostname()
 #
@@ -125,6 +129,49 @@ def configure_logging():
     return logger
 
 logger = configure_logging()
+
+# --- API Endpoints ---
+@app.route('/api/poids', methods=['POST'])
+def post_poids():
+    data = request.get_json()
+    if not data or 'poids' not in data or data['poids'] < 0:
+        return jsonify({"error": "Le modèle de données est invalide ou le poids est négatif."}), 400
+
+    poids_valeur = data['poids']
+    desktop = data.get('desktop', DESKTOP)
+    company = data.get('company', COMPANY)
+
+    try:
+        datastore.add_poids(poids_valeur, desktop, company)
+        return jsonify({"message": "Valeur ajoutée avec succès", "poids": poids_valeur}), 200
+    except Exception as e:
+        logger.error(f"API Error on POST: {e}")
+        return jsonify({"error": "Une erreur interne est survenue."}), 500
+
+@app.route('/api/poids', methods=['GET'])
+def get_poids():
+    desktop = request.args.get('desktop')
+    company = request.args.get('company')
+
+    try:
+        dernier_poids = datastore.get_dernier_poids(desktop, company)
+        if dernier_poids:
+            return jsonify(dernier_poids)
+        else:
+            return jsonify({"message": "Aucun enregistrement trouvé pour les critères fournis."}), 404
+    except Exception as e:
+        logger.error(f"API Error on GET: {e}")
+        return jsonify({"error": "Une erreur interne est survenue."}), 500
+
+def run_flask_app():
+    """Runs the Flask app in a separate thread."""
+    # Note: Werkzeug is not designed for production use as a standalone server.
+    # For a Windows service, this is generally acceptable for local-only access.
+    try:
+        # Listen on localhost only for security
+        app.run(host='127.0.0.1', port=5000)
+    except Exception as e:
+        logger.error(f"Failed to start Flask server: {e}")
 
 def find_scale_port():
     """Trouve automatiquement le port de la balance"""
@@ -170,48 +217,29 @@ def parse_weight_data(frame):
         logger.error(f"Erreur de parsing: {e} pour la trame: {frame}")
         return None
 
-def send_to_api(weight_kg):
-    """Envoie le poids à l'API via une requête POST."""
+def save_weight_locally(weight_kg):
+    """Saves the weight to the local database."""
     try:
-        payload = {"poids": weight_kg, "company": COMPANY, "desktop": DESKTOP}
-        response = requests.post(API_URL, json=payload, timeout=15)
-        
-        if response.status_code == 200:
-            logger.info(f"Poids {weight_kg}kg envoyé avec succès (POST)")
-            return True
-        else:
-            logger.error(f"Erreur POST API ({response.status_code}): {response.text} | Payload: {payload}")
-            return False
-    except requests.exceptions.RequestException as e:
-        logger.error(f"ERREUR connexion POST API: {type(e).__name__} - {e}")
+        datastore.add_poids(weight_kg, DESKTOP, COMPANY)
+        logger.info(f"Poids {weight_kg}kg enregistré localement.")
+        return True
+    except Exception as e:
+        logger.error(f"Erreur d'enregistrement local: {e}")
         return False
 
-def get_latest_weight_from_api(desktop, company):
-    """Récupère le dernier poids enregistré depuis l'API via une requête GET."""
+def get_latest_weight_from_local_db():
+    """Retrieves the last recorded weight from the local database."""
     try:
-        params = {"desktop": desktop, "company": company}
-        response = requests.get(API_URL, params=params, timeout=15)
-
-        if response.status_code == 200:
-            data = response.json()
-            if data and "valeur" in data:
-                latest_weight = float(data["valeur"])
-                logger.info(f"Dernier poids récupéré de l'API (GET): {latest_weight}kg")
-                return latest_weight
-            else:
-                logger.warning("L'API a retourné une réponse valide mais sans données de poids. On considère 0kg.")
-                return 0.0
-        elif response.status_code == 404:
-            logger.info("Aucun poids trouvé pour ce poste sur l'API (404). On considère 0kg.")
-            return 0.0
+        data = datastore.get_dernier_poids(DESKTOP, COMPANY)
+        if data and "valeur" in data:
+            latest_weight = float(data["valeur"])
+            logger.info(f"Dernier poids récupéré de la DB locale: {latest_weight}kg")
+            return latest_weight
         else:
-            logger.error(f"Erreur GET API ({response.status_code}): {response.text}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"ERREUR connexion GET API: {type(e).__name__} - {e}")
-        return None
-    except (ValueError, KeyError) as e:
-        logger.error(f"Erreur parsing réponse GET API: {e} | Réponse: {response.text}")
+            logger.info("Aucun poids trouvé en local. On considère 0kg.")
+            return 0.0
+    except Exception as e:
+        logger.error(f"Erreur de lecture de la DB locale: {e}")
         return None
 
 class OdmService(win32serviceutil.ServiceFramework):
@@ -224,6 +252,7 @@ class OdmService(win32serviceutil.ServiceFramework):
         self.hWaitStop = win32event.CreateEvent(None, 0, 0, None)
         self.is_alive = True
         self.ser = None
+        self.flask_thread = None
 
     def SvcStop(self):
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
@@ -232,6 +261,9 @@ class OdmService(win32serviceutil.ServiceFramework):
         if self.ser and self.ser.is_open:
             self.ser.close()
             logger.info("Port série fermé")
+        # Note: The Flask server running in a daemon thread will exit automatically.
+        # A more graceful shutdown would involve signaling the server to stop.
+        logger.info("Service stop requested.")
 
     def SvcDoRun(self):
         servicemanager.LogMsg(
@@ -240,6 +272,21 @@ class OdmService(win32serviceutil.ServiceFramework):
             (self._svc_name_, '')
         )
         logger.info(f"Démarrage du service {SERVICE_DISPLAY_NAME}")
+
+        # Initialize the database
+        try:
+            datastore.init_db()
+            logger.info("Database initialized.")
+        except Exception as e:
+            logger.error(f"CRITICAL: Failed to initialize database: {e}")
+            self.SvcStop()
+            return
+
+        # Start Flask server in a background thread
+        self.flask_thread = threading.Thread(target=run_flask_app, daemon=True)
+        self.flask_thread.start()
+        logger.info("Flask server thread started.")
+
         self.main()
 
     def main(self):
@@ -308,18 +355,18 @@ class OdmService(win32serviceutil.ServiceFramework):
                                                     # 4. Décision d'envoi
                                                     should_send = False
                                                     if stable_weight == 0:
-                                                        logger.info("Poids stable à 0 détecté. Vérification de la valeur sur l'API...")
-                                                        api_weight = get_latest_weight_from_api(DESKTOP, COMPANY)
-                                                        if api_weight is not None and api_weight != 0:
+                                                        logger.info("Poids stable à 0 détecté. Vérification de la valeur en local...")
+                                                        local_weight = get_latest_weight_from_local_db()
+                                                        if local_weight is not None and local_weight != 0:
                                                             should_send = True
                                                         else:
-                                                            logger.info(f"L'API est déjà à 0 ou inaccessible -> {api_weight}")
+                                                            logger.info(f"La DB locale est déjà à 0 ou inaccessible -> {local_weight}")
                                                             last_sent_weight = 0 # Met à jour l'état local pour éviter des vérifs répétées
                                                     else: # Poids positif
                                                         should_send = True
 
                                                     if should_send:
-                                                        if send_to_api(stable_weight):
+                                                        if save_weight_locally(stable_weight):
                                                             last_sent_weight = stable_weight
                                                             last_sent_time = time.time()
                                                             recent_readings.clear()

@@ -21,7 +21,8 @@ SERVICE_NAME = "OdmService"
 APP_NAME = "OdmServiceTray"
 COMPANY = "SITC, SAN-PEDRO"
 DESKTOP = socket.gethostname()
-API_URL = "https://capturepoidsapi.odmtec.com/api/poids"
+# The API is now local
+API_URL = "http://localhost:5000/api/poids"
 
 # Constantes pour la capture
 FRAME_LENGTH = 11
