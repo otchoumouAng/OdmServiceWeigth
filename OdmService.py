@@ -8,14 +8,19 @@ import logging.handlers
 import serial
 import time
 import serial.tools.list_ports
+import re # Importation du module regex
 from collections import deque
 from flask import Flask, request, jsonify
+from flask_cors import CORS # Importation de CORS
 
 # --- DataStore (local database) ---
 import datastore
 
 # --- Flask App ---
 app = Flask(__name__)
+# Configuration de CORS pour autoriser les origines spécifiques via une expression régulière
+CORS(app, origins=[re.compile(r".*odmtec.*"), re.compile(r".*otchoumouang\.github\.io.*")])
+
 
 #####################################
 
