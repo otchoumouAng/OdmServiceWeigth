@@ -10,12 +10,15 @@ import time
 import serial.tools.list_ports
 from collections import deque
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 # --- DataStore (local database) ---
 import datastore
 
 # --- Flask App ---
 app = Flask(__name__)
+# Enable CORS for all routes, allowing requests from any origin.
+CORS(app)
 
 #####################################
 
