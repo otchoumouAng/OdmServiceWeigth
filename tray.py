@@ -22,7 +22,8 @@ APP_NAME = "OdmServiceTray"
 COMPANY = "SITC, SAN-PEDRO"
 DESKTOP = socket.gethostname()
 # The API is now local
-API_URL = "http://localhost:5000/api/poids"
+API_URL_POIDS = "http://localhost:5000/api/poids"
+API_URL_LIRE_POIDS = "http://localhost:5000/api/lire_poids_reel"
 
 # Constantes pour la capture
 FRAME_LENGTH = 11
@@ -132,87 +133,25 @@ def set_autostart(enabled=True):
         print(f"Erreur autostart: {e}")
         return False
 
-def parse_weight_data(frame):
-    """Parse une trame de données de poids"""
+def get_realtime_weight_from_service():
+    """Appelle le service pour obtenir le poids en temps réel."""
     try:
-        frame_str = frame.decode('ascii')
-        if not ((frame_str.startswith('ww') or frame_str.startswith('wn')) and frame_str.endswith('kg')):
-            return None
-        
-        num_part = frame_str[2:9].replace(' ', '')
-        
-        if '-' in num_part:
-            return -int(num_part.replace('-', '').strip())
+        response = requests.get(API_URL_LIRE_POIDS, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('poids')
         else:
-            return int(num_part)
-    except (UnicodeDecodeError, ValueError):
+            print(f"Erreur API (lire poids): {response.status_code} - {response.text}")
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"Erreur de connexion au service: {e}")
         return None
-
-def capture_single_weight():
-    """Capture un seul poids depuis la balance"""
-    ser = None
-    try:
-        # Trouver le port de la balance
-        ports = serial.tools.list_ports.comports()
-        #print(f"Ports disponibles: {[p.device for p in ports]}")
-        
-        for port in ports:
-            try:
-                print(f"Essai port: {port.device}")
-                ser = serial.Serial(
-                    port=port.device,
-                    baudrate=9600,
-                    bytesize=serial.EIGHTBITS,
-                    parity=serial.PARITY_NONE,
-                    stopbits=serial.STOPBITS_ONE,
-                    timeout=2
-                )
-                time.sleep(1)  # Délai de stabilisation
-                
-                # Lire les données
-                start_time = time.time()
-                buffer = bytearray()
-                #print("Début de la capture...")
-                
-                while time.time() - start_time < CAPTURE_TIMEOUT:
-                    to_read = ser.in_waiting
-                    if to_read > 0:
-                        chunk = ser.read(to_read)
-                        buffer.extend(chunk)
-                    
-                    # Rechercher une trame valide
-                    for i in range(len(buffer)):
-                        if buffer[i] == ord('w') and len(buffer) - i >= FRAME_LENGTH:
-                            frame_candidate = bytes(buffer[i:i+FRAME_LENGTH])
-                            if frame_candidate.endswith(b'kg') and frame_candidate[1] in [ord('w'), ord('n')]:
-                                weight = parse_weight_data(frame_candidate)
-                                if weight is not None:
-                                    #print(f"Poids capturé: {weight}kg")
-                                    return weight
-                    
-                    time.sleep(0.1)
-                
-                ser.close()
-            except Exception as e:
-                print(f"Erreur port {port.device}: {str(e)}")
-                if ser and ser.is_open:
-                    ser.close()
-                continue
-        
-        return None
-    except Exception as e:
-        print(f"Erreur capture: {str(e)}")
-        traceback.print_exc()
-        return None
-    finally:
-        if ser and ser.is_open:
-            ser.close()
 
 def send_to_api(weight_kg):
-    """Envoie le poids à l'API"""
+    """Envoie le poids à l'API pour enregistrement."""
     try:
         response = requests.post(
-            API_URL, 
+            API_URL_POIDS,
             json={
                 "poids": weight_kg,
                 "company": COMPANY,
@@ -220,10 +159,10 @@ def send_to_api(weight_kg):
             }, 
             timeout=5
         )
-        print(f"Réponse API: {response.status_code} - {response.text[:50]}")
+        print(f"Réponse API (POST): {response.status_code} - {response.text[:50]}")
         return response.status_code == 200
     except Exception as e:
-        print(f"Erreur API: {str(e)}")
+        print(f"Erreur API (POST): {str(e)}")
         return False
 
 class ScaleTrayApp:
@@ -433,82 +372,42 @@ class ScaleTrayApp:
         win32gui.UnregisterClass(self.class_atom, win32gui.GetModuleHandle(None))
     
     def capture_and_send_weight(self):
-        """Gère le processus complet de capture et d'envoi"""
-        # Vérifier le verrou pour éviter les captures simultanées
+        """Gère le processus de capture via le service et l'envoi."""
         if not self.capture_lock.acquire(blocking=False):
-            win32api.MessageBox(0, "Une capture est déjà en cours", "Information", win32con.MB_ICONINFORMATION)
+            win32api.MessageBox(0, "Une capture est déjà en cours.", "Information", win32con.MB_ICONINFORMATION)
             return
-        
+
         try:
-            service_was_running = False
-            current_status = get_service_status()
-            
-            # Si le service est en cours d'exécution, on l'arrête temporairement
-            if current_status == win32service.SERVICE_RUNNING:
-                service_was_running = True
-                print("Arrêt temporaire du service...")
-                if not service_action("stop"):
-                    win32api.MessageBox(0, "Impossible d'arrêter le service", "Erreur", win32con.MB_ICONERROR)
-                    return
-                
-                # Attendre l'arrêt complet du service (max 5 secondes)
-                for _ in range(10):
-                    if get_service_status() == win32service.SERVICE_STOPPED:
-                        break
-                    time.sleep(0.5)
-                else:
-                    win32api.MessageBox(0, "Le service n'a pas pu s'arrêter à temps", "Erreur", win32con.MB_ICONERROR)
-                    return
-            
-            # Capture du poids
-            # win32api.MessageBox(
-            #     0, 
-            #     "Placez l'objet sur la balance et attendez la stabilisation...", 
-            #     "Capture en cours", 
-            #     win32con.MB_ICONINFORMATION | win32con.MB_OK
-            # )
-            
-            #print("Début de la capture du poids...")
-            weight = capture_single_weight()
-            
+            # 1. Vérifier si le service est en cours
+            if get_service_status() != win32service.SERVICE_RUNNING:
+                win32api.MessageBox(0, "Le service de capture n'est pas en cours d'exécution.", "Erreur", win32con.MB_ICONERROR)
+                return
+
+            # 2. Demander le poids au service
+            win32api.MessageBox(0, "Lecture du poids depuis la balance...", "Capture en cours", win32con.MB_ICONINFORMATION)
+            weight = get_realtime_weight_from_service()
+
             if weight is None:
-                win32api.MessageBox(
-                    0, 
-                    "Échec de la capture du poids\nVérifiez la connexion de la balance", 
-                    "Erreur", 
-                    win32con.MB_ICONERROR
-                )
+                win32api.MessageBox(0, "Échec de la lecture du poids.\nLe service est peut-être déconnecté de la balance.", "Erreur", win32con.MB_ICONERROR)
                 return
             
-            # Envoi à l'API
-            #print(f"Envoi du poids {weight}kg à l'API...")
-            if send_to_api(weight):
-                win32api.MessageBox(
-                    0, 
-                    f"Poids capturé avec succès: {weight} kg", 
-                    "Succès", 
-                    win32con.MB_ICONINFORMATION
-                )
-            else:
-                win32api.MessageBox(
-                    0, 
-                    f"Poids capturé: {weight} kg\nÉchec de l'envoi à l'API", 
-                    "Avertissement", 
-                    win32con.MB_ICONWARNING
-                )
+            # 3. Envoi du poids (déjà fait par le service, mais on le garde pour la confirmation)
+            # Le service enregistre déjà le poids, cette partie n'est plus nécessaire.
+            # On pourrait juste afficher le poids capturé.
+            win32api.MessageBox(
+                0,
+                f"Poids capturé et enregistré par le service : {weight} kg",
+                "Succès",
+                win32con.MB_ICONINFORMATION
+            )
+
         except Exception as e:
-            error_msg = f"Erreur critique: {str(e)}"
+            error_msg = f"Erreur critique lors de la capture : {e}"
             print(error_msg)
             traceback.print_exc()
-            win32api.MessageBox(0, error_msg, "Erreur", win32con.MB_ICONERROR)
+            win32api.MessageBox(0, error_msg, "Erreur Critique", win32con.MB_ICONERROR)
         finally:
-            # Redémarrer le service si nécessaire
-            if service_was_running:
-                print("Redémarrage du service...")
-                service_action("start")
-            
             self.capture_lock.release()
-            print("Capture terminée")
     
     def run(self):
         """Lancer l'application"""

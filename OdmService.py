@@ -144,6 +144,24 @@ def configure_logging():
 logger = configure_logging()
 
 # --- API Endpoints ---
+service_instance = None
+
+@app.route('/api/lire_poids_reel', methods=['GET'])
+def lire_poids_reel():
+    """Nouvel endpoint pour lire le poids à la demande."""
+    if service_instance and service_instance.ser and service_instance.ser.is_open:
+        try:
+            poids = service_instance.read_weight_on_demand()
+            if poids is not None:
+                return jsonify({"poids": poids, "unite": "kg"}), 200
+            else:
+                return jsonify({"error": "Impossible de lire un poids stable depuis la balance."}), 503
+        except Exception as e:
+            logger.error(f"Erreur lors de la lecture à la demande : {e}")
+            return jsonify({"error": f"Erreur interne du service: {e}"}), 500
+    else:
+        return jsonify({"error": "Le service n'est pas connecté à la balance."}), 503
+
 @app.route('/api/poids', methods=['POST'])
 def post_poids():
     data = request.get_json()
@@ -176,8 +194,10 @@ def get_poids():
         logger.error(f"API Error on GET: {e}")
         return jsonify({"error": "Une erreur interne est survenue."}), 500
 
-def run_flask_app():
+def run_flask_app(svc_instance):
     """Runs the Flask app in a separate thread."""
+    global service_instance
+    service_instance = svc_instance
     try:
         app.run(host='127.0.0.1', port=5000)
     except Exception as e:
@@ -264,6 +284,7 @@ class OdmService(win32serviceutil.ServiceFramework):
         self.ser = None
         self.flask_thread = None
         self.cleanup_thread = None
+        self.lock = threading.Lock()
 
     def SvcStop(self):
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
@@ -290,7 +311,7 @@ class OdmService(win32serviceutil.ServiceFramework):
             self.SvcStop()
             return
 
-        self.flask_thread = threading.Thread(target=run_flask_app, daemon=True)
+        self.flask_thread = threading.Thread(target=run_flask_app, args=(self,), daemon=True)
         self.flask_thread.start()
         logger.info("Flask server thread started.")
         
@@ -304,138 +325,113 @@ class OdmService(win32serviceutil.ServiceFramework):
     def run_cleanup_task(self):
         """Tâche de fond pour nettoyer la DB et les logs périodiquement."""
         while self.is_alive:
-            # Attend l'intervalle de temps défini
-            # On vérifie l'état de is_alive toutes les 5 secondes pour un arrêt plus réactif
-            stop_requested = self.hWaitStop.wait(CLEANUP_INTERVAL * 1000)
-            if stop_requested == win32event.WAIT_OBJECT_0:
+            stop_event_triggered = win32event.WaitForSingleObject(self.hWaitStop, CLEANUP_INTERVAL * 1000)
+            if stop_event_triggered == win32event.WAIT_OBJECT_0:
                 break
 
             if self.is_alive:
                 try:
                     logger.info("--- Début du nettoyage périodique ---")
                     
-                    # 1. Nettoyage de la base de données
                     deleted_count = datastore.cleanup_poids(keep=5)
-                    logger.info(f"Nettoyage DB: {deleted_count} anciens enregistrements supprimés. (5 conservés)")
+                    logger.info(f"Nettoyage DB: {deleted_count} anciens enregistrements supprimés.")
                     
-                    # 2. Rotation des logs
-                    # Trouve le handler de fichier et force une rotation
                     for handler in logger.handlers:
                         if isinstance(handler, logging.handlers.RotatingFileHandler):
                             handler.doRollover()
-                            logger.info("Nettoyage Logs: Rotation des fichiers de log effectuée.")
+                            logger.info("Nettoyage Logs: Rotation effectuée.")
                             break
                     
                     logger.info("--- Fin du nettoyage périodique ---")
-
                 except Exception as e:
                     logger.error(f"Erreur durant le nettoyage périodique: {e}")
 
+    def read_weight_on_demand(self):
+        """Lit une valeur de poids stable depuis la balance."""
+        with self.lock:
+            if not self.ser or not self.ser.is_open:
+                logger.error("Tentative de lecture alors que le port série n'est pas ouvert.")
+                return None
+
+            self.ser.reset_input_buffer()
+            buffer = bytearray()
+            recent_readings = deque(maxlen=STABILIZATION_COUNT)
+            start_time = time.time()
+
+            logger.info("Début de la lecture de poids à la demande...")
+
+            while time.time() - start_time < 5: # Timeout de 5 secondes
+                try:
+                    chunk = self.ser.read(self.ser.in_waiting or 1)
+                    if chunk:
+                        buffer.extend(chunk)
+
+                    # On cherche une trame complète
+                    while len(buffer) >= FRAME_LENGTH:
+                        frame_start_index = buffer.find(b'w')
+                        if frame_start_index == -1:
+                            buffer.clear() # Pas de début de trame, on vide
+                            break
+
+                        # Si on a trouvé un début, on s'assure d'avoir une trame complète
+                        if len(buffer) - frame_start_index >= FRAME_LENGTH:
+                            frame = bytes(buffer[frame_start_index : frame_start_index + FRAME_LENGTH])
+                            del buffer[:frame_start_index + FRAME_LENGTH]
+
+                            if frame.endswith(b'kg') and (frame[1] in [ord('w'), ord('n')]):
+                                weight_kg = parse_weight_data(frame)
+                                if weight_kg is not None:
+                                    recent_readings.append(weight_kg)
+
+                                    if len(recent_readings) == STABILIZATION_COUNT:
+                                        # Vérifier si les valeurs sont stables
+                                        if (max(recent_readings) - min(recent_readings)) <= 1:
+                                            stable_weight = recent_readings[-1]
+                                            logger.info(f"Poids stable détecté: {stable_weight}kg")
+                                            # Enregistrer immédiatement en local
+                                            save_weight_locally(stable_weight)
+                                            return stable_weight
+                        else:
+                            # Trame incomplète, on attend plus de données
+                            break
+                except Exception as e:
+                    logger.error(f"Erreur pendant la lecture à la demande: {e}")
+                    return None
+
+                time.sleep(0.05) # Petite pause pour ne pas surcharger le CPU
+
+            logger.warning("Timeout: Impossible de lire un poids stable en 5 secondes.")
+            return None
+
     def main(self):
+        """Boucle principale du service: maintient la connexion à la balance."""
         while self.is_alive:
             try:
-                self.ser = find_scale_port()
-                
-                if not self.ser:
-                    logger.warning("Balance non détectée! Nouvelle tentative dans 10s")
-                    time.sleep(10)
+                if self.ser and self.ser.is_open:
+                    # Le port est déjà ouvert, on attend juste
+                    if win32event.WaitForSingleObject(self.hWaitStop, 1000) == win32event.WAIT_OBJECT_0:
+                        self.is_alive = False
                     continue
 
-                logger.info(f"Connexion établie sur {self.ser.port}")
-                buffer = bytearray()
-                
-                recent_readings = deque(maxlen=STABILIZATION_COUNT)
-                last_sent_time = 0
-                last_sent_weight = None
+                # Si le port n'est pas ouvert, on tente de le trouver
+                self.ser = find_scale_port()
+                if self.ser:
+                    logger.info(f"Balance connectée sur {self.ser.port}. En attente de requêtes.")
+                else:
+                    logger.warning("Balance non détectée. Nouvelle tentative dans 10s.")
+                    if win32event.WaitForSingleObject(self.hWaitStop, 10000) == win32event.WAIT_OBJECT_0:
+                        self.is_alive = False
 
-                self.ser.timeout = 0.1
-                
-                while self.is_alive:
-                    try:
-                        chunk = self.ser.read(self.ser.in_waiting or 1)
-                        if chunk:
-                            buffer.extend(chunk)
-                        
-                        processed = True
-                        while processed and len(buffer) >= FRAME_LENGTH:
-                            processed = False
-                            found_frame = False
-                            
-                            for i in range(len(buffer) - FRAME_LENGTH + 1):
-                                if buffer[i] == ord('w'):
-                                    frame_candidate = bytes(buffer[i:i+FRAME_LENGTH])
-                                    
-                                    if (frame_candidate.endswith(b'kg') and 
-                                       (frame_candidate[1] in [ord('w'), ord('n')])):
-                                        
-                                        weight_kg = parse_weight_data(frame_candidate)
-                                        if weight_kg is not None:
-                                            recent_readings.append(weight_kg)
-                                            
-                                            if len(recent_readings) == STABILIZATION_COUNT:
-                                                is_stable = (max(recent_readings) - min(recent_readings)) <= 1
-                                                
-                                                if is_stable:
-                                                    stable_weight = recent_readings[-1]
-                                                    
-                                                    if stable_weight < 0:
-                                                        continue
-                                                    if stable_weight == last_sent_weight:
-                                                        continue
-
-                                                    time_since_last = time.time() - last_sent_time
-                                                    if time_since_last < MIN_SEND_INTERVAL:
-                                                        logger.debug(f"Valeur stable {stable_weight}kg, mais délai non écoulé ({MIN_SEND_INTERVAL - time_since_last:.1f}s restants).")
-                                                        continue
-                                                    
-                                                    should_send = False
-                                                    if stable_weight == 0:
-                                                        logger.info("Poids stable à 0 détecté. Vérification de la valeur en local...")
-                                                        local_weight = get_latest_weight_from_local_db()
-                                                        if local_weight is not None and local_weight != 0:
-                                                            should_send = True
-                                                        else:
-                                                            logger.info(f"La DB locale est déjà à 0 ou inaccessible -> {local_weight}")
-                                                            last_sent_weight = 0
-                                                    else: # Poids positif
-                                                        should_send = True
-
-                                                    if should_send:
-                                                        if save_weight_locally(stable_weight):
-                                                            last_sent_weight = stable_weight
-                                                            last_sent_time = time.time()
-                                                            recent_readings.clear()
-                                        
-                                        del buffer[:i+FRAME_LENGTH]
-                                        processed = True
-                                        found_frame = True
-                                        break
-                            
-                            if not found_frame and len(buffer) > 100:
-                                buffer.clear()
-                                logger.debug("Buffer vidé (aucune trame valide trouvée).")
-                        
-                        if win32event.WaitForSingleObject(self.hWaitStop, 100) == win32event.WAIT_OBJECT_0:
-                            self.is_alive = False
-                            break
-                            
-                    except serial.SerialException as se:
-                        logger.error(f"ERREUR PORT SÉRIE: {se}. Déconnexion.")
-                        break 
-                    except Exception as e:
-                        logger.exception(f"ERREUR LECTURE: {type(e).__name__} - {e}")
-                        time.sleep(5)
-                        break
-                
+            except serial.SerialException as se:
+                logger.error(f"Erreur port série: {se}. Reconnexion...")
                 if self.ser and self.ser.is_open:
                     self.ser.close()
-                recent_readings.clear()
-
+                time.sleep(5)
             except Exception as e:
-                logger.exception(f"ERREUR MAJEURE: {type(e).__name__} - {e}")
+                logger.exception(f"Erreur majeure dans la boucle principale: {e}")
                 time.sleep(10)
 
-        logger.info("Arrêt du service")
+        logger.info("Arrêt du service.")
 
 if __name__ == '__main__':
     if len(sys.argv) == 1:
