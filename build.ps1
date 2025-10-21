@@ -1,12 +1,11 @@
-
 param([string]$pythonVersion = "310")
 
 # Crée un environnement virtuel
 python -m venv .venv
 .\.venv\Scripts\activate
 
-# Installe les dépendances
-pip install pyinstaller pywin32 pyserial requests
+# Installe les dépendances, y compris Flask et Flask-Cors
+pip install pyinstaller pywin32 pyserial requests flask flask-cors
 
 # Trouve le chemin des DLLs pywin32
 $pywin32Path = (Get-Item .venv).FullName + "\Lib\site-packages\pywin32_system32"
@@ -19,6 +18,8 @@ $pyInstallerArgs = @(
     "--hidden-import=win32timezone",
     "--hidden-import=servicemanager",
     "--hidden-import=logging.handlers",
+    "--hidden-import=flask",
+    "--hidden-import=flask_cors",
     "--runtime-tmpdir=.",
     "--icon=NONE"
 )

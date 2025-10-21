@@ -1,26 +1,38 @@
-import os, sys, ctypes, traceback, socket, threading
-import win32serviceutil
-import win32service
-import win32event
-import servicemanager
-import logging
-import logging.handlers
-import serial
-import time
-import serial.tools.list_ports
-import re # Importation du module regex
-from collections import deque
-from flask import Flask, request, jsonify
-from flask_cors import CORS # Importation de CORS
+# --- Early-stage error logging ---
+# This helps debug startup issues before the main logger is configured.
+try:
+    import os, sys, ctypes, traceback, socket, threading
+    import win32serviceutil
+    import win32service
+    import win32event
+    import servicemanager
+    import logging
+    import logging.handlers
+    import serial
+    import time
+    import serial.tools.list_ports
+    import re 
+    from collections import deque
+    from flask import Flask, request, jsonify
+    from flask_cors import CORS
 
-# --- DataStore (local database) ---
-import datastore
+    # --- DataStore (local database) ---
+    import datastore
+
+except Exception as e:
+    log_dir_fallback = os.path.join(os.getenv('ProgramData', 'C:'), 'OdmService', 'logs')
+    if not os.path.exists(log_dir_fallback):
+        os.makedirs(log_dir_fallback, exist_ok=True)
+    with open(os.path.join(log_dir_fallback, "startup_error.log"), "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - CRITICAL STARTUP ERROR\n")
+        f.write(f"Error: {str(e)}\n")
+        f.write(traceback.format_exc())
+    sys.exit(1)
+
 
 # --- Flask App ---
 app = Flask(__name__)
-# Configuration de CORS pour autoriser les origines spécifiques via une expression régulière
 CORS(app, origins=[re.compile(r".*odmtec.*"), re.compile(r".*otchoumouang\.github\.io.*")])
-
 
 #####################################
 
@@ -74,20 +86,16 @@ except ImportError:
 
 # Solution pour les DLLs pywin32 dans les builds PyInstaller
 if getattr(sys, 'frozen', False):
-    # Mode exécutable - charger les DLLs manuellement
     base_dir = sys._MEIPASS
     os.environ['PATH'] = base_dir + os.pathsep + os.environ['PATH']
-    
-    # Charger explicitement les DLLs critiques
     try:
         import pywintypes
         import pythoncom
     except ImportError:
-        # Ajout manuel du chemin des DLLs
         dll_dir = os.path.join(base_dir)
         os.add_dll_directory(dll_dir)
 
-# Chemin absolu pour les logs (adapté pour les services Windows)
+# Chemin absolu pour les logs
 LOG_DIR = os.path.join(os.getenv('ProgramData'), 'OdmService', 'logs')
 if not os.path.exists(LOG_DIR):
     try:
@@ -102,15 +110,14 @@ LOG_FILE = os.path.join(LOG_DIR, "OdmService.log")
 # Configuration de l'API
 COMPANY = "SITC, SAN-PEDRO"
 DESKTOP = socket.gethostname()
-#
 FRAME_LENGTH = 11
 SERVICE_NAME = "OdmService"
 SERVICE_DISPLAY_NAME = "ODM - Balance Data Collector Service"
 
-# Paramètres de stabilisation
-STABILIZATION_COUNT = 3  # Nombre de lectures stables requises
-# MODIFICATION: Augmentation de l'intervalle entre les envois
-MIN_SEND_INTERVAL = 20   # Délai minimum entre 2 envois (secondes)
+# Paramètres de stabilisation et d'envoi
+STABILIZATION_COUNT = 3
+MIN_SEND_INTERVAL = 2  # Délai minimum entre 2 envois (secondes) - MODIFIÉ
+CLEANUP_INTERVAL = 600 # Intervalle de nettoyage en secondes (10 minutes)
 
 def configure_logging():
     """Configure la journalisation vers fichier et Event Viewer"""
@@ -120,6 +127,7 @@ def configure_logging():
     logger = logging.getLogger(SERVICE_NAME)
     logger.setLevel(logging.INFO)
     
+    # Garder une référence au handler pour la rotation manuelle
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=2*1024*1024, backupCount=5
     )
@@ -170,10 +178,7 @@ def get_poids():
 
 def run_flask_app():
     """Runs the Flask app in a separate thread."""
-    # Note: Werkzeug is not designed for production use as a standalone server.
-    # For a Windows service, this is generally acceptable for local-only access.
     try:
-        # Listen on localhost only for security
         app.run(host='127.0.0.1', port=5000)
     except Exception as e:
         logger.error(f"Failed to start Flask server: {e}")
@@ -258,6 +263,7 @@ class OdmService(win32serviceutil.ServiceFramework):
         self.is_alive = True
         self.ser = None
         self.flask_thread = None
+        self.cleanup_thread = None
 
     def SvcStop(self):
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
@@ -266,8 +272,6 @@ class OdmService(win32serviceutil.ServiceFramework):
         if self.ser and self.ser.is_open:
             self.ser.close()
             logger.info("Port série fermé")
-        # Note: The Flask server running in a daemon thread will exit automatically.
-        # A more graceful shutdown would involve signaling the server to stop.
         logger.info("Service stop requested.")
 
     def SvcDoRun(self):
@@ -278,7 +282,6 @@ class OdmService(win32serviceutil.ServiceFramework):
         )
         logger.info(f"Démarrage du service {SERVICE_DISPLAY_NAME}")
 
-        # Initialize the database
         try:
             datastore.init_db()
             logger.info("Database initialized.")
@@ -287,12 +290,46 @@ class OdmService(win32serviceutil.ServiceFramework):
             self.SvcStop()
             return
 
-        # Start Flask server in a background thread
         self.flask_thread = threading.Thread(target=run_flask_app, daemon=True)
         self.flask_thread.start()
         logger.info("Flask server thread started.")
+        
+        # Démarrage du thread de nettoyage
+        self.cleanup_thread = threading.Thread(target=self.run_cleanup_task, daemon=True)
+        self.cleanup_thread.start()
+        logger.info(f"Cleanup thread started. Will run every {CLEANUP_INTERVAL} seconds.")
 
         self.main()
+
+    def run_cleanup_task(self):
+        """Tâche de fond pour nettoyer la DB et les logs périodiquement."""
+        while self.is_alive:
+            # Attend l'intervalle de temps défini
+            # On vérifie l'état de is_alive toutes les 5 secondes pour un arrêt plus réactif
+            stop_requested = self.hWaitStop.wait(CLEANUP_INTERVAL * 1000)
+            if stop_requested == win32event.WAIT_OBJECT_0:
+                break
+
+            if self.is_alive:
+                try:
+                    logger.info("--- Début du nettoyage périodique ---")
+                    
+                    # 1. Nettoyage de la base de données
+                    deleted_count = datastore.cleanup_poids(keep=5)
+                    logger.info(f"Nettoyage DB: {deleted_count} anciens enregistrements supprimés. (5 conservés)")
+                    
+                    # 2. Rotation des logs
+                    # Trouve le handler de fichier et force une rotation
+                    for handler in logger.handlers:
+                        if isinstance(handler, logging.handlers.RotatingFileHandler):
+                            handler.doRollover()
+                            logger.info("Nettoyage Logs: Rotation des fichiers de log effectuée.")
+                            break
+                    
+                    logger.info("--- Fin du nettoyage périodique ---")
+
+                except Exception as e:
+                    logger.error(f"Erreur durant le nettoyage périodique: {e}")
 
     def main(self):
         while self.is_alive:
@@ -307,10 +344,9 @@ class OdmService(win32serviceutil.ServiceFramework):
                 logger.info(f"Connexion établie sur {self.ser.port}")
                 buffer = bytearray()
                 
-                # NOUVELLES VARIABLES D'ÉTAT
                 recent_readings = deque(maxlen=STABILIZATION_COUNT)
                 last_sent_time = 0
-                last_sent_weight = None # Mémorise le dernier poids envoyé
+                last_sent_weight = None
 
                 self.ser.timeout = 0.1
                 
@@ -336,28 +372,22 @@ class OdmService(win32serviceutil.ServiceFramework):
                                         if weight_kg is not None:
                                             recent_readings.append(weight_kg)
                                             
-                                            # MODIFICATION: Refonte complète de la logique de décision
                                             if len(recent_readings) == STABILIZATION_COUNT:
                                                 is_stable = (max(recent_readings) - min(recent_readings)) <= 1
                                                 
                                                 if is_stable:
                                                     stable_weight = recent_readings[-1]
                                                     
-                                                    # 1. Ignorer les poids négatifs
                                                     if stable_weight < 0:
                                                         continue
-
-                                                    # 2. Ignorer si identique au dernier poids envoyé
                                                     if stable_weight == last_sent_weight:
                                                         continue
 
-                                                    # 3. Vérifier le délai minimum
                                                     time_since_last = time.time() - last_sent_time
                                                     if time_since_last < MIN_SEND_INTERVAL:
                                                         logger.debug(f"Valeur stable {stable_weight}kg, mais délai non écoulé ({MIN_SEND_INTERVAL - time_since_last:.1f}s restants).")
                                                         continue
-
-                                                    # 4. Décision d'envoi
+                                                    
                                                     should_send = False
                                                     if stable_weight == 0:
                                                         logger.info("Poids stable à 0 détecté. Vérification de la valeur en local...")
@@ -366,7 +396,7 @@ class OdmService(win32serviceutil.ServiceFramework):
                                                             should_send = True
                                                         else:
                                                             logger.info(f"La DB locale est déjà à 0 ou inaccessible -> {local_weight}")
-                                                            last_sent_weight = 0 # Met à jour l'état local pour éviter des vérifs répétées
+                                                            last_sent_weight = 0
                                                     else: # Poids positif
                                                         should_send = True
 
@@ -391,7 +421,7 @@ class OdmService(win32serviceutil.ServiceFramework):
                             
                     except serial.SerialException as se:
                         logger.error(f"ERREUR PORT SÉRIE: {se}. Déconnexion.")
-                        break # Sort de la boucle de lecture pour tenter une reconnexion
+                        break 
                     except Exception as e:
                         logger.exception(f"ERREUR LECTURE: {type(e).__name__} - {e}")
                         time.sleep(5)
@@ -414,3 +444,4 @@ if __name__ == '__main__':
         servicemanager.StartServiceCtrlDispatcher()
     else:
         win32serviceutil.HandleCommandLine(OdmService)
+

@@ -109,6 +109,53 @@ def get_dernier_poids(desktop=None, company=None):
         print(f"Error fetching last weight from database: {e}")
         return None
 
+
+def cleanup_poids(keep=5):
+    """
+    Supprime les anciens enregistrements de la table 'poids', en ne conservant
+    que les 'keep' plus récents.
+    
+    Args:
+        keep (int): Le nombre d'enregistrements à conserver.
+        
+    Returns:
+        int: Le nombre d'enregistrements supprimés.
+    """
+    conn = None
+    deleted_count = 0
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Compter le nombre total d'enregistrements avant suppression
+        cursor.execute("SELECT COUNT(*) FROM poids")
+        total_rows = cursor.fetchone()[0]
+        
+        if total_rows > keep:
+            # Trouver l'ID du plus ancien enregistrement à conserver
+            # La sous-requête sélectionne les 'keep' IDs les plus élevés (les plus récents)
+            # La requête principale supprime tout ce qui n'est PAS dans cette liste d'IDs
+            query = """
+                DELETE FROM poids 
+                WHERE id NOT IN (
+                    SELECT id FROM poids 
+                    ORDER BY id DESC 
+                    LIMIT ?
+                )
+            """
+            cursor.execute(query, (keep,))
+            deleted_count = cursor.rowcount
+            conn.commit()
+            
+    except sqlite3.Error as e:
+        # Idéalement, logguer cette erreur
+        print(f"Database error during cleanup: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return deleted_count
+
+
 # --- Point d'entrée pour l'initialisation ---
 if __name__ == '__main__':
     print("Initializing database...")
